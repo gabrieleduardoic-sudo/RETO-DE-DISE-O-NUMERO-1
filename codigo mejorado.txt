@@ -1,0 +1,1808 @@
+/*======================================================================================
+ *  PONG NEON  ·  ESP32 + Display TFT SPI (TFT_eSPI) + 2 joysticks analógicos
+ *--------------------------------------------------------------------------------------
+ *  Versión      : 2.0 (refactorización profesional del prototipo original)
+ *  Plataforma   : PlatformIO / Arduino-ESP32
+ *  Display      : 320x240 px, rotación 1 (horizontal), driver ILI9341/ST7789 vía TFT_eSPI
+ *  Controles    : 2 joysticks analógicos (solo eje Y) + pulsador integrado de cada uno
+ *
+ *--------------------------------------------------------------------------------------
+ *  RESUMEN DE MEJORAS RESPECTO A LA VERSIÓN ORIGINAL
+ *--------------------------------------------------------------------------------------
+ *  1) RENDERIZADO POR BANDAS (band rendering)
+ *     El original intentaba crear un sprite de 320x204 @16bpp = 130 KB. En un ESP32 ese
+ *     bloque contiguo casi nunca se consigue, por lo que caía al modo "dibujo directo"
+ *     con parpadeo. Aquí el campo de juego se compone en un sprite de 320 x BAND_H
+ *     (≈32 KB) que se reutiliza para cada franja horizontal, y SOLO se envían al display
+ *     las franjas que realmente cambiaron ("dirty bands"). Resultado: cero parpadeo,
+ *     memoria baja y mucho menos tráfico SPI => más FPS.
+ *
+ *  2) FÍSICA CON PASO FIJO E INDEPENDIENTE DE LOS FPS
+ *     Antes la pelota avanzaba "N píxeles por frame": si el frame tardaba más, el juego
+ *     se ralentizaba. Ahora todas las velocidades están en píxeles/segundo y se integran
+ *     con un acumulador de paso fijo (1/120 s), así la jugabilidad es idéntica siempre.
+ *
+ *  3) COLISIONES CORREGIDAS
+ *     - Se considera el RADIO de la pelota en el test vertical (antes solo el centro,
+ *       por lo que la pelota "atravesaba" visualmente la punta de la paleta).
+ *     - Se añade la condición de borde posterior para evitar rebotes fantasma cuando la
+ *       pelota ya pasó la paleta.
+ *     - Velocidad máxima acotada para impedir tunneling (atravesar la paleta).
+ *
+ *  4) HUD QUE NO SE SOLAPA CON EL JUEGO
+ *     Todo el marcador y la BARRA DE PROGRESO de nivel viven en la franja 0..HUD_H-1.
+ *     El sprite del campo se dibuja a partir de GAME_TOP = HUD_H, por lo que es
+ *     físicamente imposible que se pisen. Además el HUD se redibuja solo cuando cambia.
+ *
+ *  5) DIMENSIONES VERIFICADAS
+ *     Paleta 8x44, pelota r=5 (11 px de diámetro). Los límites de movimiento usan el
+ *     área real de juego y la pelota rebota contra el borde interior, no contra el HUD.
+ *
+ *  6) MÁS ANIMACIONES
+ *     Intro con demo animada, menú con "atracción" (partido automático en la cabecera),
+ *     cuenta regresiva con anillo expansivo, estela de la pelota, destello y partículas
+ *     en cada golpe, sacudida de pantalla, banner de subida de nivel, explosión al
+ *     anotar, confeti y trofeo en la victoria.
+ *
+ *  7) MENÚS AMPLIADOS
+ *     Menú principal (1 jugador / 2 jugadores / Opciones / Ayuda / Créditos) y submenú
+ *     de opciones (dificultad CPU, puntos para ganar, velocidad, tema de color,
+ *     efectos, estela, calibrar joysticks). Los ajustes se guardan en NVS (Preferences).
+ *
+ *  8) ENTRADA ROBUSTA
+ *     Calibración automática del centro del joystick al arrancar (y opción manual),
+ *     filtro exponencial anti-ruido del ADC y antirrebote por flanco en los pulsadores.
+ *
+ *--------------------------------------------------------------------------------------
+ *  CABLEADO (ajustar en la sección PINES si difiere)
+ *    Joystick 1: eje Y -> GPIO34 (ADC1)   ·  pulsador SW -> GPIO16 (a GND, pull-up int.)
+ *    Joystick 2: eje Y -> GPIO35 (ADC1)   ·  pulsador SW -> GPIO17 (a GND, pull-up int.)
+ *    Display    : según User_Setup.h de TFT_eSPI.
+ *
+ *  platformio.ini sugerido:
+ *    [env:esp32dev]
+ *    platform      = espressif32
+ *    board         = esp32dev
+ *    framework     = arduino
+ *    monitor_speed = 115200
+ *    lib_deps      = bodmer/TFT_eSPI@^2.5.43
+ *    build_flags   = -DUSER_SETUP_LOADED=1 ... (o usar User_Setup.h)
+ *====================================================================================*/
+
+#include <Arduino.h>
+#include <TFT_eSPI.h>
+#include <Preferences.h>
+#include <esp_system.h>   // esp_random(): semilla aleatoria por hardware
+#include <math.h>
+
+/*======================================================================================
+ *  SECCIÓN 1 · CONFIGURACIÓN GENERAL
+ *====================================================================================*/
+
+/* ---------- 1.1 Pines ---------- */
+static const int PIN_JOY1_Y  = 34;   // Eje Y jugador 1 (ADC1, solo entrada)
+static const int PIN_JOY1_SW = 16;   // Pulsador jugador 1 (activo en LOW)
+static const int PIN_JOY2_Y  = 35;   // Eje Y jugador 2 (ADC1, solo entrada)
+static const int PIN_JOY2_SW = 17;   // Pulsador jugador 2 (activo en LOW)
+
+/* ---------- 1.2 Geometría de pantalla y del campo ---------- */
+static const int SCREEN_W    = 320;                    // Ancho físico tras setRotation(1)
+static const int SCREEN_H    = 240;                    // Alto físico
+static const int HUD_H       = 40;                     // Alto reservado al marcador
+static const int GAME_TOP    = HUD_H;                  // Primera fila del campo de juego
+static const int GAME_BOTTOM = SCREEN_H;               // Última fila (exclusiva) del campo
+static const int GAME_H      = GAME_BOTTOM - GAME_TOP; // 200 px de alto jugable
+
+/* ---------- 1.3 Objetos del juego (dimensiones verificadas) ---------- */
+static const int PADDLE_W = 8;                         // Ancho de paleta
+static const int PADDLE_H = 44;                        // Alto de paleta (cabe 4 veces en 200)
+static const int BALL_R   = 5;                         // Radio de la pelota (11 px de diámetro)
+static const int P1_X     = 12;                        // X de la paleta izquierda
+static const int P2_X     = SCREEN_W - 12 - PADDLE_W;  // X de la paleta derecha
+
+/* ---------- 1.4 Física (TODO en píxeles por segundo) ----------
+ * Equivalencia con el código original, que trabajaba a 60 FPS:
+ *   1.2 px/frame * 60 = 72 px/s  ·  +0.5 px/frame por nivel = +30 px/s
+ * Se elevan ligeramente los valores base para una sensación más ágil.        */
+static const float PHYS_STEP        = 1.0f / 120.0f;   // Paso fijo de integración (s)
+static const int   MAX_STEPS_FRAME  = 8;               // Tope anti "espiral de la muerte"
+static const float BALL_SPEED_BASE  = 95.0f;           // Velocidad al iniciar la jugada
+static const float BALL_SPEED_ACCEL = 7.0f;            // Incremento por CADA golpe
+/* Tope de velocidad. Límite teórico de "tunneling": la pelota no puede avanzar en
+ * un paso de física más que el grosor del obstáculo, es decir
+ *      v_max < (PADDLE_W + BALL_R) / PHYS_STEP = (8 + 5) * 120 = 1560 px/s.
+ * Se deja un margen de seguridad amplio (900 px/s = 7.5 px por paso).         */
+static const float BALL_SPEED_CAP   = 900.0f;
+static const float PADDLE_SPEED_MIN = 130.0f;          // Velocidad mínima de paleta
+static const float PADDLE_SPEED_MAX = 520.0f;          // Velocidad máxima de paleta
+static const float MAX_BOUNCE_ANGLE = 1.0472f;         // 60° máximo de desvío al rebotar
+
+/* ---------- 1.5 Reglas ---------- */
+static const int HITS_PER_LEVEL = 8;    // Golpes necesarios para subir de nivel
+static const int MAX_LEVEL_SHOWN = 99;  // Solo para formateo del HUD
+
+/* ---------- 1.6 Joystick / ADC ---------- */
+static const int   ADC_MAX      = 4095;  // Resolución de 12 bits
+static const int   JOY_DEADZONE = 420;   // Zona muerta alrededor del centro calibrado
+static const float JOY_FILTER   = 0.35f; // Coef. del filtro exponencial (0=lento, 1=crudo)
+
+/*======================================================================================
+ *  SECCIÓN 2 · TEMAS DE COLOR
+ *  RGB565 calculado en tiempo de compilación para poder inicializar constantes.
+ *====================================================================================*/
+#define RGB565(r, g, b) ((uint16_t)((((r) & 0xF8) << 8) | (((g) & 0xFC) << 3) | ((b) >> 3)))
+
+struct Theme {
+  const char* name;
+  uint16_t bg;      // Fondo del campo
+  uint16_t net;     // Red central
+  uint16_t p1;      // Paleta / marcador jugador 1
+  uint16_t p2;      // Paleta / marcador jugador 2
+  uint16_t ball;    // Pelota
+  uint16_t accent;  // Color de resalte (selección, barras)
+  uint16_t hud;     // Fondo del HUD
+  uint16_t text;    // Texto principal
+  uint16_t panel;   // Fondo de paneles/menús
+};
+
+/* Cuatro paletas cromáticas seleccionables desde el menú de opciones. */
+static const Theme THEMES[] = {
+  { "NEON",   RGB565(  4,  6, 16), RGB565( 38, 44, 72), RGB565(  0,229,255),
+              RGB565(255, 64,190), RGB565(255,238, 88), RGB565(255,145,  0),
+              RGB565( 14, 18, 38), RGB565(236,240,255), RGB565( 18, 24, 52) },
+  { "RETRO",  RGB565(  0,  0,  0), RGB565( 48, 48, 48), RGB565(255,255,255),
+              RGB565(200,200,200), RGB565(255,255,255), RGB565(  0,255, 80),
+              RGB565( 16, 24, 16), RGB565(220,255,220), RGB565( 10, 32, 14) },
+  { "FUEGO",  RGB565( 18,  4,  2), RGB565( 74, 28, 12), RGB565(255,140,  0),
+              RGB565(255, 72, 40), RGB565(255,232,120), RGB565(255,196,  0),
+              RGB565( 40, 10,  4), RGB565(255,236,210), RGB565( 52, 14,  6) },
+  { "HIELO",  RGB565(  2, 10, 22), RGB565( 30, 58, 86), RGB565(120,220,255),
+              RGB565(180,170,255), RGB565(240,250,255), RGB565( 90,200,255),
+              RGB565(  8, 22, 44), RGB565(228,244,255), RGB565( 10, 28, 54) }
+};
+static const int THEME_COUNT = sizeof(THEMES) / sizeof(THEMES[0]);
+
+/* Puntero al tema activo: todas las rutinas de dibujo leen de aquí. */
+static const Theme* TH = &THEMES[0];
+
+/*======================================================================================
+ *  SECCIÓN 3 · AJUSTES PERSISTENTES (NVS)
+ *====================================================================================*/
+struct Settings {
+  uint8_t difficulty;   // 0=Fácil 1=Normal 2=Difícil (CPU)
+  uint8_t pointsIdx;    // Índice en POINTS_OPTIONS
+  uint8_t speedIdx;     // 0=Lenta 1=Normal 2=Rápida
+  uint8_t themeIdx;     // Índice en THEMES
+  uint8_t effects;      // Partículas y sacudida de pantalla ON/OFF
+  uint8_t trail;        // Estela de la pelota ON/OFF
+  uint16_t joy1Center;  // Centro calibrado del joystick 1
+  uint16_t joy2Center;  // Centro calibrado del joystick 2
+  uint16_t magic;       // Marca de validez de la estructura en NVS
+};
+
+/* Marca de versión de la estructura. Al cambiarla se descartan los ajustes viejos. */
+static const uint16_t SETTINGS_MAGIC = 0xA0F2;
+
+static const char* DIFF_NAMES[]  = { "FACIL", "NORMAL", "DIFICIL" };
+static const int   POINTS_OPTIONS[] = { 3, 5, 7, 10 };
+static const int   POINTS_COUNT  = sizeof(POINTS_OPTIONS) / sizeof(POINTS_OPTIONS[0]);
+static const char* SPEED_NAMES[] = { "LENTA", "NORMAL", "RAPIDA" };
+static const float SPEED_FACTOR[] = { 0.80f, 1.00f, 1.25f };
+
+static Settings cfg;
+static Preferences prefs;
+
+/*======================================================================================
+ *  SECCIÓN 4 · OBJETOS GLOBALES DE DIBUJO
+ *====================================================================================*/
+static TFT_eSPI    tft       = TFT_eSPI();
+static TFT_eSprite fieldBand = TFT_eSprite(&tft);  // Franja reutilizable del campo
+static TFT_eSprite uiStrip   = TFT_eSprite(&tft);  // Tira animada de los menús
+
+static const int UI_STRIP_H = 40;                  // Alto de la tira animada de menús
+static int  bandH      = 50;                       // Alto real de la franja (se ajusta en setup)
+static int  bandCount  = 4;                        // Número de franjas que cubren el campo
+static bool fieldReady = false;                    // ¿Sprite de campo creado?
+static bool uiReady    = false;                    // ¿Sprite de menú creado?
+
+static const int MAX_BANDS = 25;                   // GAME_H / 8 como peor caso
+static bool bandDirty[MAX_BANDS];                  // Franjas pendientes de refrescar
+
+/*======================================================================================
+ *  SECCIÓN 5 · ESTADO DEL JUEGO
+ *====================================================================================*/
+enum GameState {
+  ST_INTRO,       // Pantalla de bienvenida animada
+  ST_MENU,        // Menú principal
+  ST_OPTIONS,     // Submenú de opciones
+  ST_HELP,        // Pantalla de controles
+  ST_CREDITS,     // Créditos
+  ST_CALIB,       // Calibración de joysticks
+  ST_COUNTDOWN,   // Cuenta regresiva 3-2-1-GO
+  ST_PLAYING,     // Partida en curso
+  ST_PAUSE,       // Menú de pausa
+  ST_POINT,       // Celebración de punto anotado
+  ST_GAMEOVER     // Pantalla de victoria
+};
+
+static GameState state = ST_INTRO;
+static bool          stateFirst  = true;   // true durante el primer ciclo de un estado
+static unsigned long stateEnter  = 0;      // millis() de entrada al estado
+
+/* --- Entidades --- */
+static float p1Y, p2Y;                     // Y superior de cada paleta (coord. de pantalla)
+static float ballX, ballY, ballVX, ballVY; // Posición y velocidad de la pelota
+
+/* --- Marcador y progresión --- */
+static int  scoreP1 = 0, scoreP2 = 0;
+static int  level = 0;                     // Nivel de la jugada actual (0 = nivel 1)
+static int  hits = 0;                      // Golpes acumulados en la jugada
+static int  rallyHits = 0;                 // Golpes del peloteo actual (estadística)
+static int  bestRally = 0;                 // Peloteo más largo de la partida
+static int  maxLevel = 0;                  // Nivel máximo alcanzado
+static bool vsAI = false;                  // Modo 1 jugador
+static int  lastScorer = 0;                // 1 o 2: quién anotó el último punto
+static unsigned long matchStart = 0;       // Inicio de partida (para estadísticas)
+
+/* --- Efectos visuales --- */
+static float shakeX = 0, shakeY = 0;       // Desplazamiento de sacudida
+static float shakeAmp = 0;                 // Amplitud actual de la sacudida
+static int   p1Flash = 0, p2Flash = 0;     // ms restantes de destello en cada paleta
+static int   bannerTimer = 0;              // ms restantes del banner de nivel
+static char  bannerText[20] = "";
+static int   goalFlashSide = 0;            // 1=pared izquierda, 2=derecha
+static int   goalFlashTimer = 0;
+
+/* --- Entrada --- */
+static float joyFiltered[2] = { 0, 0 };    // Lectura filtrada del ADC
+static bool  btnEdge[2]     = { false, false }; // Flanco de bajada (pulsación nueva)
+static bool  btnLevel[2]    = { HIGH, HIGH };   // Nivel estable tras antirrebote
+
+/* --- Navegación de menús --- */
+static int  menuIdx = 0, optIdx = 0, pauseIdx = 0;
+
+/*======================================================================================
+ *  SECCIÓN 6 · PARTÍCULAS Y ESTELA
+ *====================================================================================*/
+struct Particle {
+  float x, y, vx, vy;   // Posición (pantalla) y velocidad (px/s)
+  float life, maxLife;  // Vida restante y total (s) -> se usa para el desvanecido
+  uint16_t color;
+  uint8_t  size;
+  bool     gravity;     // ¿Le afecta la gravedad? (confeti sí, chispas no)
+  bool     active;
+};
+static const int MAX_PARTICLES = 56;
+static Particle parts[MAX_PARTICLES];
+
+static const int TRAIL_LEN = 7;            // Número de "fantasmas" de la estela
+struct TrailPoint { float x, y; bool used; };
+static TrailPoint trail[TRAIL_LEN];
+static int trailHead = 0;
+static unsigned long lastTrailPush = 0;
+
+/*======================================================================================
+ *  SECCIÓN 7 · PROTOTIPOS
+ *====================================================================================*/
+void  loadSettings();
+void  saveSettings();
+void  applyTheme();
+
+void  initInput();
+void  calibrateJoysticks(bool showUI);
+float readAxis(int pin, int idx, int center);
+void  readButtons();
+bool  anyButton();
+
+bool  createFieldSprite();
+void  destroyFieldSprite();
+bool  createUiSprite();
+void  destroyUiSprite();
+
+void  markDirtySpan(int yTop, int yBottom);
+void  markAllDirty();
+void  renderField();
+void  renderBand(int b);
+
+void  drawHUD(bool force);
+void  drawProgressBar(bool force);
+
+void  spawnBurst(float x, float y, int count, uint16_t color, float speed, bool gravity);
+void  spawnConfetti();
+void  updateParticles(float dt);
+void  drawParticlesInBand(int bandTopScreen);
+void  clearParticles();
+void  pushTrail();
+void  clearTrail();
+
+void  resetBall(int towardPlayer);
+void  resetMatch();
+void  physicsStep(float dt);
+void  updatePaddles(float dt);
+void  updateAI(float dt);
+float predictBallY();
+float currentBallSpeed();
+
+void  changeState(GameState s);
+void  drawIntro(unsigned long now);
+void  drawMenuStatic();
+void  drawMenuItems();
+void  drawOptionsStatic();
+void  drawOptionsItems();
+void  drawHelpScreen();
+void  drawCreditsScreen();
+void  drawPausePanel();
+void  drawPauseItems();
+void  drawGameOverStatic();
+void  animateUiStrip(unsigned long now, int yPos);
+
+int   menuNavigate(int currentIdx, int itemCount, unsigned long now);
+void  drawListRow(int x, int y, int w, int h, const char* label, const char* value, bool selected);
+
+/*======================================================================================
+ *  SECCIÓN 8 · AJUSTES PERSISTENTES
+ *====================================================================================*/
+
+/* Valores por defecto usados si la NVS está vacía o corrupta. */
+void setDefaults() {
+  cfg.difficulty = 1;
+  cfg.pointsIdx  = 1;      // 5 puntos
+  cfg.speedIdx   = 1;      // Normal
+  cfg.themeIdx   = 0;      // Neón
+  cfg.effects    = 1;
+  cfg.trail      = 1;
+  cfg.joy1Center = ADC_MAX / 2;
+  cfg.joy2Center = ADC_MAX / 2;
+  cfg.magic      = SETTINGS_MAGIC;
+}
+
+void loadSettings() {
+  prefs.begin("pong", false);
+  size_t len = prefs.getBytesLength("cfg");
+  if (len == sizeof(Settings)) {
+    prefs.getBytes("cfg", &cfg, sizeof(Settings));
+  }
+  if (cfg.magic != SETTINGS_MAGIC) setDefaults();   // Primera ejecución o formato viejo
+  // Saneamiento defensivo por si la estructura guardada quedó fuera de rango.
+  if (cfg.difficulty > 2)            cfg.difficulty = 1;
+  if (cfg.pointsIdx >= POINTS_COUNT) cfg.pointsIdx  = 1;
+  if (cfg.speedIdx > 2)              cfg.speedIdx   = 1;
+  if (cfg.themeIdx >= THEME_COUNT)   cfg.themeIdx   = 0;
+  applyTheme();
+}
+
+void saveSettings() {
+  cfg.magic = SETTINGS_MAGIC;
+  prefs.putBytes("cfg", &cfg, sizeof(Settings));
+}
+
+void applyTheme() { TH = &THEMES[cfg.themeIdx]; }
+
+/*======================================================================================
+ *  SECCIÓN 9 · ENTRADA (JOYSTICKS Y PULSADORES)
+ *====================================================================================*/
+
+void initInput() {
+  pinMode(PIN_JOY1_SW, INPUT_PULLUP);
+  pinMode(PIN_JOY2_SW, INPUT_PULLUP);
+  analogReadResolution(12);                       // 0..4095
+  analogSetPinAttenuation(PIN_JOY1_Y, ADC_11db);  // Rango completo ~0..3.3 V
+  analogSetPinAttenuation(PIN_JOY2_Y, ADC_11db);
+}
+
+/*  Calibra el centro de ambos ejes promediando muestras con los joysticks en reposo.
+ *  showUI=true dibuja una pantalla con barra de progreso (opción del menú).          */
+void calibrateJoysticks(bool showUI) {
+  const int SAMPLES = 64;
+  long acc1 = 0, acc2 = 0;
+
+  if (showUI) {
+    tft.fillScreen(TH->panel);
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(TH->accent, TH->panel);
+    tft.drawString("CALIBRANDO", SCREEN_W / 2, 70, 4);
+    tft.setTextColor(TH->text, TH->panel);
+    tft.drawString("No toque los joysticks", SCREEN_W / 2, 105, 2);
+    tft.drawRoundRect(50, 135, 220, 18, 4, TH->text);
+  }
+
+  for (int i = 0; i < SAMPLES; i++) {
+    acc1 += analogRead(PIN_JOY1_Y);
+    acc2 += analogRead(PIN_JOY2_Y);
+    if (showUI) {
+      int w = (216 * (i + 1)) / SAMPLES;           // Progreso interno del recuadro
+      tft.fillRect(52, 137, w, 14, TH->accent);
+    }
+    delay(8);
+  }
+
+  cfg.joy1Center = (uint16_t)(acc1 / SAMPLES);
+  cfg.joy2Center = (uint16_t)(acc2 / SAMPLES);
+  // Si el joystick estaba desviado se ignora la medida y se usa el centro teórico.
+  if (abs((int)cfg.joy1Center - ADC_MAX / 2) > 900) cfg.joy1Center = ADC_MAX / 2;
+  if (abs((int)cfg.joy2Center - ADC_MAX / 2) > 900) cfg.joy2Center = ADC_MAX / 2;
+  saveSettings();
+
+  if (showUI) {
+    char buf[40];
+    tft.setTextColor(TH->text, TH->panel);
+    snprintf(buf, sizeof(buf), "J1=%u   J2=%u", cfg.joy1Center, cfg.joy2Center);
+    tft.drawString(buf, SCREEN_W / 2, 175, 2);
+    tft.setTextColor(TH->accent, TH->panel);
+    tft.drawString("Presione boton para volver", SCREEN_W / 2, 210, 2);
+  }
+}
+
+/*  Devuelve la posición del eje normalizada en [-1..1] aplicando zona muerta y un
+ *  filtro exponencial que elimina el ruido típico del ADC del ESP32.
+ *  idx 0/1 selecciona el estado del filtro de cada joystick.                        */
+float readAxis(int pin, int idx, int center) {
+  int raw = analogRead(pin);
+  joyFiltered[idx] += (raw - joyFiltered[idx]) * JOY_FILTER;
+
+  float dev = joyFiltered[idx] - center;
+  float mag = fabsf(dev);
+  if (mag < JOY_DEADZONE) return 0.0f;
+
+  // Reescala el tramo útil (desde la zona muerta hasta el extremo) a 0..1.
+  float span = (float)(center > ADC_MAX / 2 ? center : ADC_MAX - center) - JOY_DEADZONE;
+  if (span < 1) span = 1;
+  float n = (mag - JOY_DEADZONE) / span;
+  if (n > 1.0f) n = 1.0f;
+
+  return (dev > 0) ? n : -n;
+}
+
+/*  Antirrebote por tiempo + detección de flanco de bajada. btnEdge[] es válido
+ *  solo durante el ciclo de loop() en el que se produjo la pulsación.               */
+void readButtons() {
+  static bool          last[2]     = { HIGH, HIGH };
+  static unsigned long lastDb[2]   = { 0, 0 };
+  const unsigned long  DEBOUNCE_MS = 45;
+
+  const int pins[2] = { PIN_JOY1_SW, PIN_JOY2_SW };
+  unsigned long now = millis();
+
+  for (int i = 0; i < 2; i++) {
+    btnEdge[i] = false;
+    bool reading = digitalRead(pins[i]);
+    if (reading != last[i]) lastDb[i] = now;
+    if ((now - lastDb[i]) > DEBOUNCE_MS && reading != btnLevel[i]) {
+      btnLevel[i] = reading;
+      if (btnLevel[i] == LOW) btnEdge[i] = true;   // Pulsado (lógica invertida)
+    }
+    last[i] = reading;
+  }
+}
+
+bool anyButton() { return btnEdge[0] || btnEdge[1]; }
+
+/*======================================================================================
+ *  SECCIÓN 10 · GESTIÓN DE SPRITES
+ *  Los sprites se crean y destruyen según el estado para no mantener dos buffers
+ *  grandes en RAM al mismo tiempo.
+ *====================================================================================*/
+
+/*  Crea la franja del campo probando alturas decrecientes (todas divisores de 200)
+ *  hasta que la reserva de memoria tenga éxito.                                     */
+bool createFieldSprite() {
+  if (fieldReady) return true;
+  /* Se prueban alturas decrecientes; todas dividen exactamente GAME_H (200).
+   * Una banda mas baja refresca menos pixeles por frame (mejor fluidez) a costa
+   * de mas volcados SPI. 25 px es el mejor compromiso.                        */
+  const int candidates[] = { 25, 20, 40, 50, 10, 8 };
+  fieldBand.setColorDepth(16);
+  for (unsigned i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
+    if (fieldBand.createSprite(SCREEN_W, candidates[i]) != nullptr) {
+      bandH      = candidates[i];
+      bandCount  = GAME_H / bandH;
+      fieldReady = true;
+      return true;
+    }
+  }
+  return false;
+}
+
+void destroyFieldSprite() {
+  if (fieldReady) { fieldBand.deleteSprite(); fieldReady = false; }
+}
+
+bool createUiSprite() {
+  if (uiReady) return true;
+  uiStrip.setColorDepth(16);
+  if (uiStrip.createSprite(SCREEN_W, UI_STRIP_H) != nullptr) { uiReady = true; return true; }
+  return false;
+}
+
+void destroyUiSprite() {
+  if (uiReady) { uiStrip.deleteSprite(); uiReady = false; }
+}
+
+/*======================================================================================
+ *  SECCIÓN 11 · SISTEMA DE FRANJAS SUCIAS (DIRTY BANDS)
+ *  Solo se recomponen y envían por SPI las franjas cuyo contenido cambió.
+ *====================================================================================*/
+
+/*  Marca como sucias todas las franjas que intersectan el rango vertical dado,
+ *  expresado en coordenadas de pantalla.                                            */
+void markDirtySpan(int yTop, int yBottom) {
+  if (yBottom < GAME_TOP || yTop >= GAME_BOTTOM) return;   // Fuera del campo
+  if (yTop < GAME_TOP)       yTop = GAME_TOP;
+  if (yBottom >= GAME_BOTTOM) yBottom = GAME_BOTTOM - 1;
+
+  int b0 = (yTop - GAME_TOP) / bandH;
+  int b1 = (yBottom - GAME_TOP) / bandH;
+  if (b0 < 0) b0 = 0;
+  if (b1 >= bandCount) b1 = bandCount - 1;
+  for (int b = b0; b <= b1; b++) bandDirty[b] = true;
+}
+
+void markAllDirty() {
+  for (int b = 0; b < bandCount; b++) bandDirty[b] = true;
+}
+
+/*  Recompone y envía únicamente las franjas marcadas. Este es el corazón del
+ *  renderizado: una sola llamada por frame desde loop().                            */
+void renderField() {
+  if (!fieldReady) return;
+  for (int b = 0; b < bandCount; b++) {
+    if (!bandDirty[b]) continue;
+    renderBand(b);
+    fieldBand.pushSprite(0, GAME_TOP + b * bandH);
+    bandDirty[b] = false;
+  }
+}
+
+/*  Dibuja el contenido completo de una franja. El recorte lo hace el propio sprite:
+ *  basta con trasladar las coordenadas de pantalla al sistema local de la franja.   */
+void renderBand(int b) {
+  const int bandTop = GAME_TOP + b * bandH;   // Y de pantalla donde inicia la franja
+  const int oy      = -bandTop;               // Desplazamiento pantalla -> sprite
+
+  /* 1) Fondo */
+  fieldBand.fillSprite(TH->bg);
+
+  /* 2) Red central discontinua (estética clásica de Pong) */
+  const int netX = SCREEN_W / 2 - 2;
+  for (int y = GAME_TOP + 6; y < GAME_BOTTOM; y += 16) {
+    fieldBand.fillRect(netX, y + oy, 4, 9, TH->net);
+  }
+
+  /* 3) Destello de gol en la pared correspondiente */
+  if (goalFlashTimer > 0) {
+    uint16_t c = (goalFlashSide == 1) ? TH->p2 : TH->p1;
+    if (goalFlashSide == 1) fieldBand.fillRect(0, GAME_TOP + oy, 3, GAME_H, c);
+    else                    fieldBand.fillRect(SCREEN_W - 3, GAME_TOP + oy, 3, GAME_H, c);
+  }
+
+  /* 4) Estela de la pelota (fantasmas cada vez más pequeños y oscuros) */
+  if (cfg.trail && state == ST_PLAYING) {
+    for (int i = 0; i < TRAIL_LEN; i++) {
+      int idx = (trailHead - 1 - i + TRAIL_LEN * 2) % TRAIL_LEN;
+      if (!trail[idx].used) continue;
+      int r = BALL_R - 1 - (i * BALL_R) / (TRAIL_LEN + 1);
+      if (r < 1) continue;
+      // Mezcla manual hacia el fondo para simular transparencia.
+      uint8_t f = 200 - (uint8_t)(i * 26);
+      uint16_t c = fieldBand.alphaBlend(f, TH->ball, TH->bg);
+      fieldBand.fillCircle((int)trail[idx].x + shakeX,
+                           (int)trail[idx].y + shakeY + oy, r, c);
+    }
+  }
+
+  /* 5) Partículas */
+  drawParticlesInBand(bandTop);
+
+  /* 6) Paletas (con destello blanco momentáneo al golpear) */
+  uint16_t c1 = (p1Flash > 0) ? TFT_WHITE : TH->p1;
+  uint16_t c2 = (p2Flash > 0) ? TFT_WHITE : TH->p2;
+  fieldBand.fillRoundRect(P1_X + (int)shakeX, (int)p1Y + (int)shakeY + oy,
+                          PADDLE_W, PADDLE_H, 3, c1);
+  fieldBand.fillRoundRect(P2_X + (int)shakeX, (int)p2Y + (int)shakeY + oy,
+                          PADDLE_W, PADDLE_H, 3, c2);
+  // Filo interior más claro: da sensación de volumen "neón".
+  fieldBand.drawFastVLine(P1_X + PADDLE_W - 1 + (int)shakeX,
+                          (int)p1Y + (int)shakeY + oy, PADDLE_H, TFT_WHITE);
+  fieldBand.drawFastVLine(P2_X + (int)shakeX,
+                          (int)p2Y + (int)shakeY + oy, PADDLE_H, TFT_WHITE);
+
+  /* 7) Pelota, con núcleo claro para dar profundidad */
+  if (state != ST_POINT) {
+    int bx = (int)ballX + (int)shakeX;
+    int by = (int)ballY + (int)shakeY + oy;
+    fieldBand.fillCircle(bx, by, BALL_R, TH->ball);
+    fieldBand.fillCircle(bx - 1, by - 1, BALL_R / 2, TFT_WHITE);
+  }
+
+  /* 8) Superposiciones de texto (cuenta atrás, banner de nivel, "PUNTO") */
+  fieldBand.setTextDatum(MC_DATUM);
+
+  if (state == ST_COUNTDOWN) {
+    unsigned long el = millis() - stateEnter;
+    int step = 3 - (int)(el / 800);                 // 3, 2, 1, GO!
+    int cy = GAME_TOP + GAME_H / 2 + oy;
+    // Anillo que se expande y se desvanece dentro de cada intervalo de 800 ms.
+    int phase = el % 800;
+    int radius = 20 + (phase * 55) / 800;
+    uint16_t ringC = fieldBand.alphaBlend(255 - (uint8_t)((phase * 255) / 800),
+                                          TH->accent, TH->bg);
+    fieldBand.drawCircle(SCREEN_W / 2, cy, radius, ringC);
+    fieldBand.drawCircle(SCREEN_W / 2, cy, radius + 1, ringC);
+
+    if (step > 0) {
+      fieldBand.setTextColor(TH->ball);
+      fieldBand.drawNumber(step, SCREEN_W / 2, cy, 6);
+    } else {
+      fieldBand.setTextColor(TH->accent);
+      fieldBand.setTextSize(2);
+      fieldBand.drawString("GO!", SCREEN_W / 2, cy, 4);  // Fuente 4: soporta letras
+      fieldBand.setTextSize(1);
+    }
+  }
+
+  if (state == ST_POINT) {
+    int cy = GAME_TOP + GAME_H / 2 + oy;
+    unsigned long el = millis() - stateEnter;
+    // Entrada deslizante: el texto llega desde el lateral y se frena.
+    float t = el < 250 ? (float)el / 250.0f : 1.0f;
+    float ease = 1.0f - (1.0f - t) * (1.0f - t);
+    int fromX = (lastScorer == 1) ? -160 : SCREEN_W + 160;
+    int x = (int)(fromX + (SCREEN_W / 2 - fromX) * ease);
+
+    fieldBand.setTextColor((lastScorer == 1) ? TH->p1 : TH->p2);
+    fieldBand.setTextSize(2);
+    fieldBand.drawString("PUNTO", x, cy - 16, 4);
+    fieldBand.setTextSize(1);
+    fieldBand.setTextColor(TH->text);
+    // cy-16 con fuente 4 a tamano 2 ocupa hasta cy+10; se deja margen hasta cy+26.
+    fieldBand.drawString(lastScorer == 1 ? "JUGADOR 1"
+                                         : (vsAI ? "CPU" : "JUGADOR 2"), x, cy + 28, 4);
+  }
+
+  if (bannerTimer > 0) {
+    // Banner de subida de nivel: aparece bajo el HUD y se desvanece solo.
+    int by = GAME_TOP + 26 + oy;
+    fieldBand.setTextColor(TH->accent);
+    fieldBand.drawString(bannerText, SCREEN_W / 2, by, 4);
+  }
+}
+
+/*======================================================================================
+ *  SECCIÓN 12 · HUD (MARCADOR Y BARRA DE PROGRESO)
+ *  Vive íntegramente en y = 0..HUD_H-1, por lo que NUNCA se solapa con el campo.
+ *====================================================================================*/
+
+void drawHUD(bool force) {
+  static int cS1 = -1, cS2 = -1, cLv = -1;
+  if (!force && scoreP1 == cS1 && scoreP2 == cS2 && level == cLv) {
+    drawProgressBar(false);       // Aun así la barra puede haber cambiado
+    return;
+  }
+  cS1 = scoreP1; cS2 = scoreP2; cLv = level;
+
+  char buf[24];
+  tft.fillRect(0, 0, SCREEN_W, HUD_H, TH->hud);
+
+  /* ---- Distribución vertical del HUD (alto total = 40 px) ----------------
+   *   y  2 ..  9  : etiquetas P1 / P2 (fuente 1, 8 px) y meta de la partida
+   *   y 12 .. 28  : marcador (fuente 4, 26 px) y rótulo de nivel (fuente 2)
+   *   y 31 .. 37  : barra de progreso de nivel
+   *   y 39        : línea separadora
+   * IMPORTANTE: no se usa la fuente 6 (48 px) porque desbordaría el HUD e
+   * invadiría el campo de juego. La fuente 4 mide 26 px y encaja justo.     */
+
+  /* --- Bloque izquierdo: jugador 1 --- */
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextColor(TH->text, TH->hud);
+  tft.drawString("P1", 9, 2, 1);
+  tft.setTextColor(TH->p1, TH->hud);
+  snprintf(buf, sizeof(buf), "%d", scoreP1);
+  tft.drawString(buf, 8, 12, 4);
+
+  /* --- Bloque derecho: jugador 2 o CPU --- */
+  tft.setTextDatum(TR_DATUM);
+  tft.setTextColor(TH->text, TH->hud);
+  tft.drawString(vsAI ? "CPU" : "P2", SCREEN_W - 9, 2, 1);
+  tft.setTextColor(TH->p2, TH->hud);
+  snprintf(buf, sizeof(buf), "%d", scoreP2);
+  tft.drawString(buf, SCREEN_W - 8, 12, 4);
+
+  /* --- Bloque central: meta de la partida y nivel actual --- */
+  tft.setTextDatum(TC_DATUM);
+  tft.setTextColor(TH->text, TH->hud);
+  snprintf(buf, sizeof(buf), "META %d PUNTOS", POINTS_OPTIONS[cfg.pointsIdx]);
+  tft.drawString(buf, SCREEN_W / 2, 2, 1);
+
+  tft.setTextColor(TH->accent, TH->hud);
+  int lv = level + 1; if (lv > MAX_LEVEL_SHOWN) lv = MAX_LEVEL_SHOWN;
+  snprintf(buf, sizeof(buf), "NIVEL %d", lv);
+  tft.drawString(buf, SCREEN_W / 2, 12, 2);
+
+  /* --- Línea separadora: frontera visual entre HUD y campo --- */
+  tft.drawFastHLine(0, HUD_H - 1, SCREEN_W, TH->p1);
+
+  drawProgressBar(true);
+}
+
+/*  Barra de progreso hacia el siguiente nivel.
+ *  Ocupa y = 31..37, es decir, ENTERAMENTE dentro del HUD. Como el sprite del
+ *  campo se vuelca a partir de y = GAME_TOP (40), es imposible que la barra se
+ *  solape con las paletas, la pelota o cualquier efecto del juego.            */
+void drawProgressBar(bool force) {
+  static int cachedHits = -1;
+  int inLevel = hits % HITS_PER_LEVEL;
+  if (!force && inLevel == cachedHits) return;
+  cachedHits = inLevel;
+
+  const int bx = 104, by = 31, bw = 112, bh = 7;
+  tft.drawRoundRect(bx, by, bw, bh, 2, TH->net);
+  tft.fillRect(bx + 1, by + 1, bw - 2, bh - 2, TH->hud);       // Limpia el interior
+  int fill = ((bw - 2) * inLevel) / HITS_PER_LEVEL;
+  if (fill > 0) tft.fillRect(bx + 1, by + 1, fill, bh - 2, TH->accent);
+
+  /* Marcas de división: ayudan a leer cuántos golpes faltan para subir nivel. */
+  for (int i = 1; i < HITS_PER_LEVEL; i++) {
+    int mx = bx + 1 + ((bw - 2) * i) / HITS_PER_LEVEL;
+    tft.drawFastVLine(mx, by + 2, bh - 4, (i * HITS_PER_LEVEL <= inLevel * HITS_PER_LEVEL)
+                                          ? TH->hud : TH->net);
+  }
+}
+
+/*======================================================================================
+ *  SECCIÓN 13 · PARTÍCULAS
+ *====================================================================================*/
+
+/*  Lanza un abanico de partículas desde (x,y). Se usa en golpes, goles y victoria. */
+void spawnBurst(float x, float y, int count, uint16_t color, float speed, bool gravity) {
+  if (!cfg.effects) return;
+  for (int i = 0, spawned = 0; i < MAX_PARTICLES && spawned < count; i++) {
+    if (parts[i].active) continue;
+    float a = random(0, 628) / 100.0f;                 // Ángulo aleatorio 0..2π
+    float s = speed * (0.45f + random(0, 100) / 100.0f);
+    parts[i].x = x; parts[i].y = y;
+    parts[i].vx = cosf(a) * s;
+    parts[i].vy = sinf(a) * s;
+    parts[i].maxLife = parts[i].life = 0.35f + random(0, 40) / 100.0f;
+    parts[i].color   = color;
+    parts[i].size    = 1 + random(0, 3);
+    parts[i].gravity = gravity;
+    parts[i].active  = true;
+    spawned++;
+  }
+}
+
+/*  Confeti de la pantalla de victoria: cae desde arriba con gravedad. */
+void spawnConfetti() {
+  if (!cfg.effects) return;
+  const uint16_t palette[] = { TH->p1, TH->p2, TH->ball, TH->accent, TFT_WHITE };
+  for (int i = 0; i < MAX_PARTICLES; i++) {
+    if (parts[i].active) continue;
+    parts[i].x  = random(0, SCREEN_W);
+    parts[i].y  = -random(0, 40);
+    parts[i].vx = random(-30, 30);
+    parts[i].vy = random(40, 110);
+    parts[i].maxLife = parts[i].life = 2.5f + random(0, 150) / 100.0f;
+    parts[i].color   = palette[random(0, 5)];
+    parts[i].size    = 2 + random(0, 3);
+    parts[i].gravity = true;
+    parts[i].active  = true;
+    return;                                            // Una por llamada: caída escalonada
+  }
+}
+
+/*  Integra el movimiento de las partículas y marca sucias las franjas afectadas
+ *  (tanto la posición anterior como la nueva, para borrar el rastro).              */
+void updateParticles(float dt) {
+  for (int i = 0; i < MAX_PARTICLES; i++) {
+    if (!parts[i].active) continue;
+    float oldY = parts[i].y;
+
+    parts[i].x += parts[i].vx * dt;
+    parts[i].y += parts[i].vy * dt;
+    if (parts[i].gravity) parts[i].vy += 260.0f * dt;  // Gravedad suave
+    parts[i].life -= dt;
+
+    if (parts[i].life <= 0 || parts[i].y > SCREEN_H + 8 ||
+        parts[i].x < -8 || parts[i].x > SCREEN_W + 8) {
+      parts[i].active = false;
+    }
+    if (state == ST_PLAYING || state == ST_POINT || state == ST_COUNTDOWN) {
+      int top = (int)fminf(oldY, parts[i].y) - 4;
+      int bot = (int)fmaxf(oldY, parts[i].y) + 4;
+      markDirtySpan(top, bot);
+    }
+  }
+}
+
+/*  Dibuja en la franja actual las partículas que caen dentro de ella. */
+void drawParticlesInBand(int bandTopScreen) {
+  for (int i = 0; i < MAX_PARTICLES; i++) {
+    if (!parts[i].active) continue;
+    int y = (int)parts[i].y - bandTopScreen;
+    if (y < -6 || y > bandH + 6) continue;             // Descarte rápido
+    // Se atenúa el color según la vida restante para un apagado progresivo.
+    uint8_t alpha = (uint8_t)(255.0f * (parts[i].life / parts[i].maxLife));
+    uint16_t c = fieldBand.alphaBlend(alpha, parts[i].color, TH->bg);
+    fieldBand.fillCircle((int)parts[i].x, y, parts[i].size, c);
+  }
+}
+
+void clearParticles() {
+  for (int i = 0; i < MAX_PARTICLES; i++) parts[i].active = false;
+}
+
+/*  Inserta la posición actual de la pelota en el buffer circular de la estela. */
+void pushTrail() {
+  trail[trailHead].x = ballX;
+  trail[trailHead].y = ballY;
+  trail[trailHead].used = true;
+  trailHead = (trailHead + 1) % TRAIL_LEN;
+}
+
+void clearTrail() {
+  for (int i = 0; i < TRAIL_LEN; i++) trail[i].used = false;
+  trailHead = 0;
+}
+
+/*======================================================================================
+ *  SECCIÓN 14 · LÓGICA Y FÍSICA DEL JUEGO
+ *====================================================================================*/
+
+/*  Velocidad actual de la pelota.
+ *  La aceleración es CONTINUA (crece un poco con cada golpe) en lugar de a saltos
+ *  por nivel: así la dificultad sube de forma suave y, sobre todo, se evita que
+ *  dos jugadores muy parejos encadenen peloteos interminables.
+ *  El "nivel" que muestra el HUD sigue siendo hits/HITS_PER_LEVEL y funciona como
+ *  indicador legible de lo lejos que ha llegado el peloteo.                       */
+float currentBallSpeed() {
+  float s = (BALL_SPEED_BASE + hits * BALL_SPEED_ACCEL) * SPEED_FACTOR[cfg.speedIdx];
+  return (s > BALL_SPEED_CAP) ? BALL_SPEED_CAP : s;
+}
+
+/*  Coloca la pelota en el centro. towardPlayer: 1 = sale hacia P1, 2 = hacia P2,
+ *  0 = dirección aleatoria.                                                        */
+void resetBall(int towardPlayer) {
+  ballX = SCREEN_W / 2.0f;
+  ballY = GAME_TOP + GAME_H / 2.0f;
+
+  float speed = currentBallSpeed();
+  // Ángulo inicial moderado (±25°) para que el saque sea siempre jugable.
+  float ang = (random(-250, 250) / 1000.0f) * (float)PI;
+  ang = constrain(ang, -0.44f, 0.44f);
+
+  int dir;
+  if (towardPlayer == 1)      dir = -1;
+  else if (towardPlayer == 2) dir = 1;
+  else                        dir = (random(0, 2) == 0) ? -1 : 1;
+
+  ballVX = dir * speed * cosf(ang);
+  ballVY = speed * sinf(ang);
+  clearTrail();
+}
+
+/*  Reinicia marcador, niveles, posiciones y estadísticas de una partida nueva. */
+void resetMatch() {
+  scoreP1 = scoreP2 = 0;
+  level = hits = rallyHits = 0;
+  bestRally = maxLevel = 0;
+  p1Y = p2Y = GAME_TOP + (GAME_H - PADDLE_H) / 2.0f;
+  shakeAmp = shakeX = shakeY = 0;
+  p1Flash = p2Flash = bannerTimer = goalFlashTimer = 0;
+  clearParticles();
+  clearTrail();
+  matchStart = millis();
+  resetBall(0);
+}
+
+/*  Mueve las paletas. El jugador 1 siempre es humano; el 2 puede ser CPU. */
+void updatePaddles(float dt) {
+  /* --- Jugador 1: control proporcional (cuanto más se inclina, más rápido) --- */
+  float a1 = readAxis(PIN_JOY1_Y, 0, cfg.joy1Center);
+  if (a1 != 0.0f) {
+    float sp = PADDLE_SPEED_MIN + (PADDLE_SPEED_MAX - PADDLE_SPEED_MIN) * fabsf(a1);
+    p1Y += (a1 > 0 ? sp : -sp) * dt;
+  }
+
+  /* --- Jugador 2 --- */
+  if (vsAI) {
+    updateAI(dt);
+  } else {
+    float a2 = readAxis(PIN_JOY2_Y, 1, cfg.joy2Center);
+    if (a2 != 0.0f) {
+      float sp = PADDLE_SPEED_MIN + (PADDLE_SPEED_MAX - PADDLE_SPEED_MIN) * fabsf(a2);
+      p2Y += (a2 > 0 ? sp : -sp) * dt;
+    }
+  }
+
+  /* --- Límites del área jugable (las paletas nunca invaden el HUD) --- */
+  p1Y = constrain(p1Y, (float)GAME_TOP, (float)(GAME_BOTTOM - PADDLE_H));
+  p2Y = constrain(p2Y, (float)GAME_TOP, (float)(GAME_BOTTOM - PADDLE_H));
+}
+
+/*  Predice en qué Y cruzará la pelota el plano de la paleta derecha, reflejándola
+ *  en las paredes superior e inferior. Solo la usa la dificultad DIFÍCIL.          */
+float predictBallY() {
+  if (ballVX <= 0) return GAME_TOP + GAME_H / 2.0f;    // Se aleja: vuelve al centro
+
+  float x = ballX, y = ballY, vy = ballVY;
+  float t = (P2_X - BALL_R - x) / ballVX;              // Tiempo hasta el plano
+  y += vy * t;
+
+  // Refleja el resultado dentro de la banda [GAME_TOP+R, GAME_BOTTOM-R].
+  float top = GAME_TOP + BALL_R, bot = GAME_BOTTOM - BALL_R;
+  float span = bot - top;
+  if (span <= 0) return GAME_TOP + GAME_H / 2.0f;
+  float rel = fmodf(y - top, 2 * span);
+  if (rel < 0) rel += 2 * span;
+  if (rel > span) rel = 2 * span - rel;
+  return top + rel;
+}
+
+/*  IA con reacción imperfecta: piensa cada X ms, con error aleatorio y velocidad
+ *  limitada según la dificultad. Así resulta vencible y natural.                   */
+void updateAI(float dt) {
+  static unsigned long lastThink = 0;
+  static float target = 0;
+
+  // Parámetros por dificultad: {velocidad px/s, periodo de reacción ms, error px}
+  const float aiSpeed[3]  = { 190.0f, 280.0f, 400.0f };
+  const int   aiThink[3]  = { 220,    120,     45     };
+  const int   aiError[3]  = { 30,     16,      6      };
+
+  unsigned long now = millis();
+  int d = cfg.difficulty;
+
+  if (now - lastThink >= (unsigned long)aiThink[d]) {
+    lastThink = now;
+    float aim;
+    if (d == 2) {
+      aim = predictBallY();                            // Difícil: anticipa la trayectoria
+    } else if (ballVX > 0) {
+      aim = ballY;                                     // Sigue la pelota si viene hacia él
+    } else {
+      aim = GAME_TOP + GAME_H / 2.0f;                  // Si se aleja, regresa al centro
+    }
+    target = aim - PADDLE_H / 2.0f + random(-aiError[d], aiError[d] + 1);
+  }
+
+  float diff = target - p2Y;
+  float step = aiSpeed[d] * dt;
+  if (fabsf(diff) <= step) p2Y = target;
+  else                     p2Y += (diff > 0 ? step : -step);
+}
+
+/*  Un paso de simulación de duración fija dt. Contiene movimiento, colisiones,
+ *  puntuación y disparo de efectos.                                                */
+void physicsStep(float dt) {
+  updatePaddles(dt);
+
+  float prevX = ballX;
+  ballX += ballVX * dt;
+  ballY += ballVY * dt;
+
+  /* --- Rebote contra paredes superior e inferior del CAMPO (no del HUD) --- */
+  if (ballY - BALL_R <= GAME_TOP) {
+    ballY = GAME_TOP + BALL_R;
+    ballVY = fabsf(ballVY);
+    spawnBurst(ballX, ballY, 4, TH->net, 90, false);
+  } else if (ballY + BALL_R >= GAME_BOTTOM) {
+    ballY = GAME_BOTTOM - BALL_R;
+    ballVY = -fabsf(ballVY);
+    spawnBurst(ballX, ballY, 4, TH->net, 90, false);
+  }
+
+  /* La velocidad se recalcula en cada golpe e incluye la aceleración acumulada. */
+  float speed = currentBallSpeed();
+
+  /* --- Colisión con la paleta 1 (izquierda) ---
+   * Condiciones: va hacia la izquierda, el borde izquierdo de la pelota entra en la
+   * cara derecha de la paleta, y aún no la ha rebasado (evita rebotes fantasma).
+   * El test vertical incluye el radio de la pelota.                                */
+  if (ballVX < 0 &&
+      ballX - BALL_R <= P1_X + PADDLE_W && ballX + BALL_R >= P1_X &&
+      ballY + BALL_R >= p1Y && ballY - BALL_R <= p1Y + PADDLE_H) {
+
+    ballX = P1_X + PADDLE_W + BALL_R;                  // Extrae la pelota del sólido
+    float rel  = (ballY - (p1Y + PADDLE_H / 2.0f)) / (PADDLE_H / 2.0f);
+    rel = constrain(rel, -1.0f, 1.0f);
+    float ang  = rel * MAX_BOUNCE_ANGLE;               // Golpear el borde => más ángulo
+    ballVX =  speed * cosf(ang);
+    ballVY =  speed * sinf(ang);
+
+    hits++; rallyHits++;
+    p1Flash = 90;
+    if (cfg.effects) shakeAmp = 2.5f;
+    spawnBurst(ballX, ballY, 8, TH->p1, 150, false);
+    markDirtySpan((int)p1Y - 4, (int)p1Y + PADDLE_H + 4);
+    if (hits % HITS_PER_LEVEL == 0) {                  // Progresión infinita de nivel
+      level++;
+      if (level > maxLevel) maxLevel = level;
+      snprintf(bannerText, sizeof(bannerText), "NIVEL %d", level + 1);
+      bannerTimer = 1100;
+    }
+  }
+
+  /* --- Colisión con la paleta 2 (derecha) --- */
+  if (ballVX > 0 &&
+      ballX + BALL_R >= P2_X && ballX - BALL_R <= P2_X + PADDLE_W &&
+      ballY + BALL_R >= p2Y && ballY - BALL_R <= p2Y + PADDLE_H) {
+
+    ballX = P2_X - BALL_R;
+    float rel  = (ballY - (p2Y + PADDLE_H / 2.0f)) / (PADDLE_H / 2.0f);
+    rel = constrain(rel, -1.0f, 1.0f);
+    float ang  = rel * MAX_BOUNCE_ANGLE;
+    ballVX = -speed * cosf(ang);
+    ballVY =  speed * sinf(ang);
+
+    hits++; rallyHits++;
+    p2Flash = 90;
+    if (cfg.effects) shakeAmp = 2.5f;
+    spawnBurst(ballX, ballY, 8, TH->p2, 150, false);
+    markDirtySpan((int)p2Y - 4, (int)p2Y + PADDLE_H + 4);
+    if (hits % HITS_PER_LEVEL == 0) {
+      level++;
+      if (level > maxLevel) maxLevel = level;
+      snprintf(bannerText, sizeof(bannerText), "NIVEL %d", level + 1);
+      bannerTimer = 1100;
+    }
+  }
+
+  /* --- Gol --- */
+  if (ballX + BALL_R < 0) {
+    scoreP2++; lastScorer = 2; goalFlashSide = 1; goalFlashTimer = 400;
+    spawnBurst(4, ballY, 14, TH->p2, 210, false);
+    changeState(ST_POINT);
+  } else if (ballX - BALL_R > SCREEN_W) {
+    scoreP1++; lastScorer = 1; goalFlashSide = 2; goalFlashTimer = 400;
+    spawnBurst(SCREEN_W - 4, ballY, 14, TH->p1, 210, false);
+    changeState(ST_POINT);
+  }
+
+  (void)prevX;   // Reservado por si se desea ampliar a colisión barrida (swept)
+}
+
+/*======================================================================================
+ *  SECCIÓN 15 · ELEMENTOS DE INTERFAZ REUTILIZABLES
+ *====================================================================================*/
+
+/*  Dibuja una fila de lista con etiqueta a la izquierda y (opcionalmente) valor a la
+ *  derecha. Se usa tanto en el menú principal como en opciones y pausa.            */
+void drawListRow(int x, int y, int w, int h, const char* label, const char* value, bool selected) {
+  uint16_t bg   = selected ? TH->accent : TH->panel;
+  uint16_t fg   = selected ? TFT_BLACK  : TH->text;
+  uint16_t edge = selected ? TFT_WHITE  : TH->net;
+
+  tft.fillRoundRect(x, y, w, h, 5, bg);
+  tft.drawRoundRect(x, y, w, h, 5, edge);
+
+  tft.setTextDatum(ML_DATUM);
+  tft.setTextColor(fg, bg);
+  tft.drawString(label, x + 12, y + h / 2, 2);
+
+  if (value && value[0]) {
+    tft.setTextDatum(MR_DATUM);
+    tft.setTextColor(selected ? TFT_BLACK : TH->accent, bg);
+    tft.drawString(value, x + w - 12, y + h / 2, 2);
+  }
+
+  // Marcador triangular de selección para reforzar la lectura.
+  if (selected) tft.fillTriangle(x + 4, y + h / 2 - 4, x + 4, y + h / 2 + 4,
+                                 x + 8, y + h / 2, TFT_BLACK);
+}
+
+/*  Navegación vertical con el joystick 1, con repetición controlada por tiempo.
+ *  Devuelve el nuevo índice.                                                       */
+int menuNavigate(int currentIdx, int itemCount, unsigned long now) {
+  static unsigned long lastMove = 0;
+  static bool centered = true;
+
+  float a = readAxis(PIN_JOY1_Y, 0, cfg.joy1Center);
+
+  if (a == 0.0f) { centered = true; return currentIdx; }
+
+  // Primer movimiento inmediato; después repetición cada 220 ms si se mantiene.
+  unsigned long delayMs = centered ? 0 : 220;
+  if (now - lastMove < delayMs) return currentIdx;
+
+  lastMove = now;
+  centered = false;
+  int idx = currentIdx + (a > 0 ? 1 : -1);
+  if (idx < 0) idx = itemCount - 1;                    // Navegación circular
+  if (idx >= itemCount) idx = 0;
+  return idx;
+}
+
+/*  Tira animada usada como cabecera de los menús: una mini-partida automática.
+ *  Se compone en un sprite, por lo que no parpadea.                               */
+void animateUiStrip(unsigned long now, int yPos) {
+  if (!uiReady) return;
+
+  // Limitador a ~33 fps: la tira mide 320x40 px y volcarla en cada iteración
+  // del loop saturaría el bus SPI sin ninguna mejora visual.
+  static unsigned long lastFrame = 0;
+  if (now - lastFrame < 30) return;
+  lastFrame = now;
+
+  // Estado local de la demo (persiste entre llamadas).
+  static float dx = 40, dy = 20, dvx = 78, dvy = 46;
+  static float dp1 = 12, dp2 = 12;
+  static unsigned long last = 0;
+
+  float dt = (last == 0) ? 0 : (now - last) / 1000.0f;
+  last = now;
+  if (dt > 0.08f) dt = 0.08f;                          // Evita saltos tras una pausa larga
+
+  const int H = UI_STRIP_H, PW = 4, PH = 14;
+  dx += dvx * dt; dy += dvy * dt;
+  if (dy < 4)      { dy = 4;      dvy = fabsf(dvy); }
+  if (dy > H - 4)  { dy = H - 4;  dvy = -fabsf(dvy); }
+  if (dx < 16)     { dx = 16;     dvx = fabsf(dvx); }
+  if (dx > SCREEN_W - 16) { dx = SCREEN_W - 16; dvx = -fabsf(dvx); }
+
+  // Las paletas de la demo persiguen la pelota con retardo (movimiento orgánico).
+  dp1 += ((dy - PH / 2) - dp1) * 3.0f * dt;
+  dp2 += ((dy - PH / 2) - dp2) * 2.2f * dt;
+  dp1 = constrain(dp1, 1.0f, (float)(H - PH - 1));
+  dp2 = constrain(dp2, 1.0f, (float)(H - PH - 1));
+
+  uiStrip.fillSprite(TH->bg);
+  for (int x = 0; x < SCREEN_W; x += 14) uiStrip.drawFastVLine(x, 0, H, TH->net);
+  uiStrip.fillRoundRect(8, (int)dp1, PW, PH, 2, TH->p1);
+  uiStrip.fillRoundRect(SCREEN_W - 8 - PW, (int)dp2, PW, PH, 2, TH->p2);
+  uiStrip.fillCircle((int)dx, (int)dy, 3, TH->ball);
+  uiStrip.drawFastHLine(0, H - 1, SCREEN_W, TH->accent);
+  uiStrip.pushSprite(0, yPos);
+}
+
+/*======================================================================================
+ *  SECCIÓN 16 · PANTALLAS
+ *====================================================================================*/
+
+/* ---------- 16.1 Intro ---------- */
+void drawIntro(unsigned long now) {
+  if (stateFirst) {
+    tft.fillScreen(TH->bg);
+
+    // Título con "sombra neón": se dibuja desplazado en un color secundario.
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextSize(2);
+    //tft.setTextColor(TH->p2, TH->bg);
+    //tft.drawString("PONG", SCREEN_W / 2 - 58 + 2, 44 + 2, 4);
+    tft.setTextColor(TH->p1, TH->bg);
+    tft.drawString("PONG", SCREEN_W / 2 - 70, 44, 4);
+    tft.setTextColor(TH->ball, TH->bg);
+    tft.drawString("NEON", SCREEN_W / 2 + 70, 44, 4);
+    tft.setTextSize(1);
+
+    tft.setTextColor(TH->text, TH->bg);
+    tft.drawString("Proyecto 1 de Microcontroladores", SCREEN_W / 2, 70, 2);
+    tft.drawString("ESP32 - TFT SPI - 2 Joysticks", SCREEN_W / 2, 85, 1);
+    tft.drawString("Gabriel - COD: xxxxxx", SCREEN_W / 2, 98, 1);
+    tft.drawString("Jhonattan Suarez - COD: 1161299", SCREEN_W / 2, 111, 1);
+
+    tft.drawRoundRect(60, 196, 200, 12, 3, TH->net);   // Marco de la barra de carga
+    tft.setTextColor(TH->accent, TH->bg);
+    tft.drawString("Presione boton para continuar", SCREEN_W / 2, 224, 1);
+  }
+
+  animateUiStrip(now, 124);                            // Demo animada centrada
+
+  // Barra de carga: se llena en 4 s y entonces salta al menú.
+  unsigned long el = now - stateEnter;
+  int w = (int)((196L * (long)min(el, 4000UL)) / 4000L);
+  tft.fillRect(62, 198, w, 8, TH->accent);
+
+  if (el > 4000 || anyButton()) changeState(ST_MENU);
+}
+
+/* ---------- 16.2 Menú principal ---------- */
+static const char* MENU_ITEMS[] = {
+  "1 JUGADOR  (vs CPU)",
+  "2 JUGADORES",
+  "OPCIONES",
+  "CONTROLES / AYUDA",
+  "CREDITOS"
+};
+static const int MENU_COUNT = sizeof(MENU_ITEMS) / sizeof(MENU_ITEMS[0]);
+
+void drawMenuStatic() {
+  tft.fillScreen(TH->panel);
+  tft.setTextDatum(TC_DATUM);
+  tft.setTextColor(TH->text, TH->panel);
+  tft.drawString("Joystick 1: mover   -   Boton: elegir", SCREEN_W / 2, 224, 1);
+  drawMenuItems();
+}
+
+void drawMenuItems() {
+  const int x = 26, w = 268, h = 26, y0 = 50, gap = 33;
+  for (int i = 0; i < MENU_COUNT; i++) {
+    drawListRow(x, y0 + i * gap, w, h, MENU_ITEMS[i], nullptr, i == menuIdx);
+  }
+}
+
+/* ---------- 16.3 Opciones ---------- */
+static const char* OPT_LABELS[] = {
+  "Dificultad CPU",
+  "Puntos para ganar",
+  "Velocidad pelota",
+  "Tema de color",
+  "Efectos visuales",
+  "Estela de pelota",
+  "Calibrar joysticks",
+  "Volver"
+};
+static const int OPT_COUNT = sizeof(OPT_LABELS) / sizeof(OPT_LABELS[0]);
+
+/*  Devuelve el texto del valor asociado a cada opción. */
+static const char* optionValue(int i, char* buf, size_t n) {
+  switch (i) {
+    case 0: return DIFF_NAMES[cfg.difficulty];
+    case 1: snprintf(buf, n, "%d", POINTS_OPTIONS[cfg.pointsIdx]); return buf;
+    case 2: return SPEED_NAMES[cfg.speedIdx];
+    case 3: return THEMES[cfg.themeIdx].name;
+    case 4: return cfg.effects ? "SI" : "NO";
+    case 5: return cfg.trail ? "SI" : "NO";
+    default: return "";
+  }
+}
+
+/*  Aplica un cambio (+1/-1) sobre la opción seleccionada. */
+static void optionChange(int i, int dir) {
+  switch (i) {
+    case 0: cfg.difficulty = (uint8_t)((cfg.difficulty + 3 + dir) % 3); break;
+    case 1: cfg.pointsIdx  = (uint8_t)((cfg.pointsIdx + POINTS_COUNT + dir) % POINTS_COUNT); break;
+    case 2: cfg.speedIdx   = (uint8_t)((cfg.speedIdx + 3 + dir) % 3); break;
+    case 3: cfg.themeIdx   = (uint8_t)((cfg.themeIdx + THEME_COUNT + dir) % THEME_COUNT);
+            applyTheme();
+            drawOptionsStatic();                        // El tema cambia toda la paleta
+            return;
+    case 4: cfg.effects = !cfg.effects; break;
+    case 5: cfg.trail   = !cfg.trail;   break;
+    default: return;
+  }
+  drawOptionsItems();
+}
+
+void drawOptionsStatic() {
+  tft.fillScreen(TH->panel);
+  tft.setTextDatum(TC_DATUM);
+  tft.setTextColor(TH->accent, TH->panel);
+  tft.drawString("OPCIONES", SCREEN_W / 2, 6, 4);
+  tft.setTextColor(TH->text, TH->panel);
+  tft.drawString("Joy1: mover  -  Joy2 o Boton1: cambiar  -  Boton2: volver",
+                 SCREEN_W / 2, 230, 1);
+  drawOptionsItems();
+}
+
+void drawOptionsItems() {
+  const int x = 18, w = 284, h = 21, y0 = 40, gap = 24;
+  char buf[12];
+  for (int i = 0; i < OPT_COUNT; i++) {
+    drawListRow(x, y0 + i * gap, w, h, OPT_LABELS[i],
+                optionValue(i, buf, sizeof(buf)), i == optIdx);
+  }
+}
+
+/* ---------- 16.4 Ayuda y créditos ---------- */
+void drawHelpScreen() {
+  tft.fillScreen(TH->panel);
+  tft.setTextDatum(TC_DATUM);
+  tft.setTextColor(TH->accent, TH->panel);
+  tft.drawString("CONTROLES", SCREEN_W / 2, 8, 4);
+
+  /* Cada linea se mantiene por debajo de ~34 caracteres en fuente 2 (~8 px por
+   * caracter) para no desbordar los 320 px de ancho de la pantalla.          */
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextColor(TH->text, TH->panel);
+  int y = 44;
+  tft.drawString("Joy 1 (eje Y): paleta izquierda", 16, y, 2); y += 21;
+  tft.drawString("Joy 2 (eje Y): paleta derecha",   16, y, 2); y += 21;
+  tft.drawString("Boton 1: confirmar y pausar",     16, y, 2); y += 21;
+  tft.drawString("Boton 2: volver o cancelar",      16, y, 2); y += 26;
+
+  tft.setTextColor(TH->ball, TH->panel);
+  tft.drawString("Mas inclinacion = mas velocidad", 16, y, 2); y += 21;
+
+  tft.setTextColor(TH->p1, TH->panel);
+  tft.drawString("Golpea con el borde: mas angulo", 16, y, 2); y += 21;
+  tft.drawString("Cada 8 golpes subes de nivel",    16, y, 2); y += 21;
+
+  tft.setTextColor(TH->p2, TH->panel);
+  tft.drawString("Quien recibe el punto, saca",     16, y, 2);
+
+  tft.setTextDatum(TC_DATUM);
+  tft.setTextColor(TH->accent, TH->panel);
+  tft.drawString("Presione un boton para volver", SCREEN_W / 2, 226, 1);
+}
+
+void drawCreditsScreen() {
+  tft.fillScreen(TH->panel);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(TH->accent, TH->panel);
+  tft.drawString("CREDITOS", SCREEN_W / 2, 30, 4);
+
+  tft.setTextColor(TH->text, TH->panel);
+  tft.drawString("PONG NEON  v2.0", SCREEN_W / 2, 80, 4);
+  tft.drawString("Proyecto 1 de Microcontroladores", SCREEN_W / 2, 112, 2);
+  tft.drawString("Hardware: ESP32 + TFT SPI + JoysStick", SCREEN_W / 2, 136, 2);
+  tft.drawString("Software: PlatformIo + VS Code", SCREEN_W / 2, 158, 2);
+  tft.drawString("UFPS - 2026", SCREEN_W / 2, 180, 2);
+
+  tft.setTextColor(TH->accent, TH->panel);
+  tft.drawString("Presione un boton para volver", SCREEN_W / 2, 214, 1);
+}
+
+/* ---------- 16.5 Pausa ---------- */
+static const char* PAUSE_ITEMS[] = { "Continuar", "Reiniciar partida", "Salir al menu" };
+static const int PAUSE_COUNT = sizeof(PAUSE_ITEMS) / sizeof(PAUSE_ITEMS[0]);
+
+void drawPausePanel() {
+  const int px = 50, py = 62, pw = 220, ph = 140;
+  tft.fillRoundRect(px, py, pw, ph, 10, TH->panel);
+  tft.drawRoundRect(px, py, pw, ph, 10, TH->accent);
+  tft.setTextDatum(TC_DATUM);
+  tft.setTextColor(TH->accent, TH->panel);
+  tft.drawString("PAUSA", SCREEN_W / 2, py + 8, 4);
+  drawPauseItems();
+}
+
+void drawPauseItems() {
+  const int x = 64, w = 192, h = 24, y0 = 104, gap = 28;
+  for (int i = 0; i < PAUSE_COUNT; i++) {
+    drawListRow(x, y0 + i * gap, w, h, PAUSE_ITEMS[i], nullptr, i == pauseIdx);
+  }
+}
+
+/* ---------- 16.6 Fin de partida ---------- */
+void drawGameOverStatic() {
+  tft.fillScreen(TH->bg);
+  const bool p1Wins = (scoreP1 > scoreP2);
+  const uint16_t wc = p1Wins ? TH->p1 : TH->p2;
+
+  /* Trofeo dibujado con primitivas (copa + asas + base) */
+  const int tx = SCREEN_W / 2, ty = 54;
+  tft.fillRect(tx - 18, ty - 16, 36, 22, TH->accent);
+  tft.fillTriangle(tx - 18, ty + 6, tx + 18, ty + 6, tx, ty + 24, TH->accent);
+  tft.drawCircle(tx - 24, ty - 4, 8, TH->accent);
+  tft.drawCircle(tx + 24, ty - 4, 8, TH->accent);
+  tft.fillRect(tx - 4, ty + 24, 8, 10, TH->accent);
+  tft.fillRoundRect(tx - 16, ty + 34, 32, 7, 2, TH->accent);
+
+  /* Estadísticas de la partida */
+  char buf[40];
+  tft.setTextDatum(TC_DATUM);
+  tft.setTextColor(TH->text, TH->bg);
+  snprintf(buf, sizeof(buf), "MARCADOR  %d  -  %d | Mejor peloteo: %d", scoreP1, scoreP2, bestRally);
+  tft.drawString(buf, SCREEN_W / 2, 195, 2);
+  //snprintf(buf, sizeof(buf), "Mejor peloteo: %d golpes", bestRally);
+  //tft.drawString(buf, SCREEN_W / 2, 174, 1);
+  snprintf(buf, sizeof(buf), "Nivel maximo: %d | Duracion: %lu s", maxLevel + 1, (millis() - matchStart) / 1000UL);
+  tft.drawString(buf, SCREEN_W / 2, 213, 1);
+  //snprintf(buf, sizeof(buf), "Duracion: %lu s", (millis() - matchStart) / 1000UL);
+  //tft.drawString(buf, SCREEN_W / 2, 198, 1);
+
+  tft.setTextColor(TH->accent, TH->bg);
+  tft.drawString("Boton 1: revancha   -   Boton 2: menu", SCREEN_W / 2, 225, 1);
+  (void)wc;
+}
+
+/*======================================================================================
+ *  SECCIÓN 17 · MÁQUINA DE ESTADOS
+ *====================================================================================*/
+
+/*  Cambia de estado gestionando la creación/destrucción de sprites y el dibujo
+ *  inicial de cada pantalla. Centralizar esto evita los "static bool drawn" que
+ *  ensuciaban el código original.                                                  */
+void changeState(GameState s) {
+  state      = s;
+  stateFirst = true;
+  stateEnter = millis();
+
+  switch (s) {
+    case ST_INTRO:
+      destroyFieldSprite();
+      createUiSprite();
+      break;
+
+    case ST_MENU:
+      destroyFieldSprite();
+      createUiSprite();
+      drawMenuStatic();
+      break;
+
+    case ST_OPTIONS:
+      drawOptionsStatic();
+      break;
+
+    case ST_HELP:
+      drawHelpScreen();
+      break;
+
+    case ST_CREDITS:
+      drawCreditsScreen();
+      break;
+
+    case ST_CALIB:
+      calibrateJoysticks(true);
+      break;
+
+    case ST_COUNTDOWN:
+      destroyUiSprite();                 // Libera RAM antes de crear la franja
+      if (!createFieldSprite()) {        // Sin memoria: aviso claro en vez de pantalla negra
+        tft.fillScreen(TFT_BLACK);
+        tft.setTextDatum(MC_DATUM);
+        tft.setTextColor(TFT_WHITE, TFT_BLACK);
+        tft.drawString("ERROR: memoria insuficiente", SCREEN_W / 2, 110, 2);
+        tft.drawString("para crear el buffer grafico", SCREEN_W / 2, 132, 2);
+        delay(2500);
+        changeState(ST_MENU);
+        return;
+      }
+      tft.fillScreen(TH->bg);
+      drawHUD(true);
+      markAllDirty();
+      break;
+
+    case ST_PLAYING:
+      markAllDirty();
+      break;
+
+    case ST_POINT:
+      if (rallyHits > bestRally) bestRally = rallyHits;
+      markAllDirty();
+      break;
+
+    case ST_PAUSE:
+      drawPausePanel();
+      break;
+
+    case ST_GAMEOVER:
+      destroyFieldSprite();
+      clearParticles();
+      drawGameOverStatic();
+      break;
+  }
+}
+
+/*  Inicia una partida nueva con el modo indicado. */
+static void startMatch(bool againstAI) {
+  vsAI = againstAI;
+  resetMatch();
+  changeState(ST_COUNTDOWN);
+}
+
+/*======================================================================================
+ *  SECCIÓN 18 · SETUP
+ *====================================================================================*/
+void setup() {
+  Serial.begin(115200);
+
+  initInput();
+  loadSettings();
+
+  tft.init();
+  tft.setRotation(1);                    // Horizontal: 320x240
+  tft.fillScreen(THEMES[cfg.themeIdx].bg);
+  // Nota: no se fuerza setSwapBytes(); TFT_eSprite::pushSprite() ya ajusta
+  // internamente el orden de bytes, y forzarlo invertiria los colores.
+
+  // Semilla robusta: hardware RNG del ESP32 (mejor que analogRead de un pin libre).
+  randomSeed(esp_random());
+
+  // Primera calibración silenciosa (el usuario no debería tocar los mandos al encender).
+  if (cfg.joy1Center == ADC_MAX / 2 && cfg.joy2Center == ADC_MAX / 2) {
+    calibrateJoysticks(false);
+  }
+  // Precarga el filtro con el valor actual para evitar un salto inicial.
+  joyFiltered[0] = analogRead(PIN_JOY1_Y);
+  joyFiltered[1] = analogRead(PIN_JOY2_Y);
+
+  changeState(ST_INTRO);
+}
+
+/*======================================================================================
+ *  SECCIÓN 19 · LOOP PRINCIPAL
+ *  Estructura: leer entrada -> actualizar estado -> integrar física -> renderizar.
+ *====================================================================================*/
+void loop() {
+  const unsigned long now = millis();
+  static unsigned long lastLoop = 0;
+  float frameDt = (lastLoop == 0) ? 0.016f : (now - lastLoop) / 1000.0f;
+  lastLoop = now;
+  if (frameDt > 0.10f) frameDt = 0.10f;   // Acota saltos tras operaciones largas
+
+  readButtons();
+
+  switch (state) {
+
+    /* ---------------------------------------------------------------- INTRO */
+    case ST_INTRO:
+      drawIntro(now);
+      break;
+
+    /* ----------------------------------------------------------- MENÚ PRINCIPAL */
+    case ST_MENU: {
+      animateUiStrip(now, 8);                        // Cabecera viva
+
+      int prev = menuIdx;
+      menuIdx = menuNavigate(menuIdx, MENU_COUNT, now);
+      if (menuIdx != prev) drawMenuItems();          // Redibuja solo la lista
+
+      if (btnEdge[0]) {
+        switch (menuIdx) {
+          case 0: startMatch(true);            break;
+          case 1: startMatch(false);           break;
+          case 2: optIdx = 0;
+                  changeState(ST_OPTIONS);     break;
+          case 3: changeState(ST_HELP);        break;
+          case 4: changeState(ST_CREDITS);     break;
+        }
+      }
+      break;
+    }
+
+    /* ---------------------------------------------------------------- OPCIONES */
+    case ST_OPTIONS: {
+      int prev = optIdx;
+      optIdx = menuNavigate(optIdx, OPT_COUNT, now);
+      if (optIdx != prev) drawOptionsItems();
+
+      // El joystick 2 modifica el valor de la opción seleccionada.
+      static unsigned long lastChange = 0;
+      float a2 = readAxis(PIN_JOY2_Y, 1, cfg.joy2Center);
+      if (a2 != 0.0f && now - lastChange > 260 && optIdx < 6) {
+        lastChange = now;
+        optionChange(optIdx, a2 > 0 ? 1 : -1);
+        saveSettings();
+      }
+
+      if (btnEdge[0]) {
+        if (optIdx == 6)        { changeState(ST_CALIB); }
+        else if (optIdx == 7)   { saveSettings(); menuIdx = 2; changeState(ST_MENU); }
+        else                    { optionChange(optIdx, 1); saveSettings(); }
+      }
+      if (btnEdge[1]) { saveSettings(); menuIdx = 2; changeState(ST_MENU); }
+      break;
+    }
+
+    /* ------------------------------------------------------- AYUDA / CRÉDITOS */
+    case ST_HELP:
+    case ST_CREDITS:
+      // Se ignoran pulsaciones en los primeros 250 ms para no salir por rebote.
+      if (anyButton() && now - stateEnter > 250) { changeState(ST_MENU); }
+      break;
+
+    /* ------------------------------------------------------------ CALIBRACIÓN */
+    case ST_CALIB:
+      if (anyButton() && now - stateEnter > 400) { optIdx = 6; changeState(ST_OPTIONS); }
+      break;
+
+    /* ------------------------------------------------------------ CUENTA ATRÁS */
+    case ST_COUNTDOWN: {
+      unsigned long el = now - stateEnter;
+
+      // Se permite mover las paletas durante la cuenta atrás: el jugador puede
+      // colocarse antes del saque, lo que se siente mucho más natural.
+      updatePaddles(frameDt);
+
+      // La animación del anillo cubre todo el campo, así que se refresca completo,
+      // pero limitado a ~33 fps para no saturar el bus SPI.
+      static unsigned long lastCd = 0;
+      if (now - lastCd >= 30) {
+        lastCd = now;
+        markAllDirty();
+        renderField();
+      }
+      if (el >= 3200) changeState(ST_PLAYING);       // 3 - 2 - 1 - GO!
+      break;
+    }
+
+    /* ----------------------------------------------------------------- PARTIDA */
+    case ST_PLAYING: {
+      /* Pausa */
+      if (btnEdge[0] || btnEdge[1]) { pauseIdx = 0; changeState(ST_PAUSE); break; }
+
+      /* --- Integración de la física con paso fijo ---
+       * Garantiza que la velocidad del juego no dependa de los FPS.               */
+      static float accumulator = 0;
+      accumulator += frameDt;
+      int steps = 0;
+      int prevP1 = (int)p1Y, prevP2 = (int)p2Y;
+      int prevBX = (int)ballX, prevBY = (int)ballY;
+
+      while (accumulator >= PHYS_STEP && steps < MAX_STEPS_FRAME && state == ST_PLAYING) {
+        physicsStep(PHYS_STEP);
+        accumulator -= PHYS_STEP;
+        steps++;
+      }
+      if (accumulator > PHYS_STEP * MAX_STEPS_FRAME) accumulator = 0;  // Anti-atasco
+      if (state != ST_PLAYING) break;                // physicsStep pudo anotar un punto
+
+      /* --- Temporizadores de efectos ------------------------------------------
+       * Se guarda el estado ANTERIOR de cada efecto: si un temporizador acaba de
+       * expirar hay que repintar su zona una última vez, o el destello/banner
+       * se quedaría congelado en pantalla.                                    */
+      int dtMs = (int)(frameDt * 1000.0f);
+      static bool p1WasFlash = false, p2WasFlash = false, bannerWasOn = false;
+
+      if (p1Flash > 0)        p1Flash        = max(0, p1Flash - dtMs);
+      if (p2Flash > 0)        p2Flash        = max(0, p2Flash - dtMs);
+      if (goalFlashTimer > 0) goalFlashTimer = max(0, goalFlashTimer - dtMs);
+      if (bannerTimer > 0)    bannerTimer    = max(0, bannerTimer - dtMs);
+
+      if (bannerTimer > 0 || bannerWasOn) markDirtySpan(GAME_TOP, GAME_TOP + 46);
+      bannerWasOn = (bannerTimer > 0);
+
+      /* --- Sacudida de pantalla: oscila y se amortigua --- */
+      if (shakeAmp > 0.05f) {
+        shakeX = (random(-100, 100) / 100.0f) * shakeAmp;
+        shakeY = (random(-100, 100) / 100.0f) * shakeAmp;
+        shakeAmp *= 0.85f;
+        markAllDirty();                              // Todo se desplaza: refresco total
+      } else if (shakeX != 0 || shakeY != 0) {
+        shakeX = shakeY = 0;
+        markAllDirty();                              // Último frame para volver al sitio
+      }
+
+      /* --- Estela ---
+       * Se registra una posición cada 22 ms y, además, se marcan como sucias las
+       * franjas de TODOS los fantasmas activos: así el rastro se borra solo
+       * cuando cada punto expira del buffer circular.                         */
+      if (cfg.trail) {
+        if (now - lastTrailPush > 22) { lastTrailPush = now; pushTrail(); }
+        for (int i = 0; i < TRAIL_LEN; i++) {
+          if (trail[i].used)
+            markDirtySpan((int)trail[i].y - BALL_R - 2, (int)trail[i].y + BALL_R + 2);
+        }
+      }
+
+      updateParticles(frameDt);
+
+      /* --- Marcado de zonas sucias -------------------------------------------
+       * Clave del rendimiento: una paleta inmóvil NO ensucia su franja, así que
+       * en un frame típico solo se reenvía la franja de la pelota y la de la
+       * paleta que se está moviendo (en vez de los 320x200 px completos).
+       * renderBand() redibuja la franja entera, por lo que el resultado siempre
+       * es correcto aunque la paleta quieta caiga en una franja sucia.        */
+      if ((int)p1Y != prevP1 || p1Flash > 0 || p1WasFlash)
+        markDirtySpan(min(prevP1, (int)p1Y) - 2, max(prevP1, (int)p1Y) + PADDLE_H + 2);
+      if ((int)p2Y != prevP2 || p2Flash > 0 || p2WasFlash)
+        markDirtySpan(min(prevP2, (int)p2Y) - 2, max(prevP2, (int)p2Y) + PADDLE_H + 2);
+      p1WasFlash = (p1Flash > 0);
+      p2WasFlash = (p2Flash > 0);
+      markDirtySpan(min(prevBY, (int)ballY) - BALL_R - 2,
+                    max(prevBY, (int)ballY) + BALL_R + 2);
+      (void)prevBX;
+
+      renderField();
+      drawHUD(false);                                // Solo redibuja si algo cambió
+      break;
+    }
+
+    /* ------------------------------------------------------------------- PAUSA */
+    case ST_PAUSE: {
+      int prev = pauseIdx;
+      pauseIdx = menuNavigate(pauseIdx, PAUSE_COUNT, now);
+      if (pauseIdx != prev) drawPauseItems();
+
+      if (btnEdge[0]) {
+        switch (pauseIdx) {
+          case 0:                                    // Continuar
+            markAllDirty();
+            renderField();                           // Borra el panel de pausa
+            drawHUD(true);
+            state = ST_PLAYING;
+            stateFirst = false;
+            break;
+          case 1:                                    // Reiniciar partida
+            resetMatch();
+            changeState(ST_COUNTDOWN);
+            break;
+          case 2:                                    // Salir al menú
+            menuIdx = 0;
+            changeState(ST_MENU);
+            break;
+        }
+      }
+      if (btnEdge[1]) {                              // Botón 2 = reanudar directo
+        markAllDirty();
+        renderField();
+        drawHUD(true);
+        state = ST_PLAYING;
+        stateFirst = false;
+      }
+      break;
+    }
+
+    /* -------------------------------------------------------- PUNTO ANOTADO */
+    case ST_POINT: {
+      updateParticles(frameDt);
+      int dtMs = (int)(frameDt * 1000.0f);
+      if (goalFlashTimer > 0) goalFlashTimer = max(0, goalFlashTimer - dtMs);
+
+      markAllDirty();                                // El cartel ocupa todo el campo
+      renderField();
+      drawHUD(false);
+
+      if (now - stateEnter > 1500) {
+        const int target = POINTS_OPTIONS[cfg.pointsIdx];
+        if (scoreP1 >= target || scoreP2 >= target) {
+          changeState(ST_GAMEOVER);
+        } else {
+          // Nueva jugada: el nivel y el contador de golpes se reinician.
+          level = 0; hits = 0; rallyHits = 0;
+          bannerTimer = 0;
+          clearParticles();
+          resetBall(lastScorer == 1 ? 2 : 1);        // Saca quien recibió el punto
+          drawHUD(true);
+          changeState(ST_COUNTDOWN);
+        }
+      }
+      break;
+    }
+
+    /* --------------------------------------------------------- FIN DE PARTIDA */
+    case ST_GAMEOVER: {
+      /* Texto del ganador con pulso de color (parpadeo suave cada 320 ms) */
+      static unsigned long flashT = 0;
+      static bool on = false;
+      if (now - flashT > 320) {
+        flashT = now;
+        on = !on;
+        const bool p1Wins = (scoreP1 > scoreP2);
+        const char* who = p1Wins ? "JUGADOR 1" : (vsAI ? "GANA LA CPU" : "JUGADOR 2");
+        uint16_t wc = p1Wins ? TH->p1 : TH->p2;
+
+        tft.setTextDatum(TC_DATUM);
+        tft.setTextColor(on ? TH->accent : TH->ball, TH->bg);
+        tft.drawString("! VICTORIA !", SCREEN_W / 2, 100, 4);
+        tft.setTextColor(on ? wc : TH->text, TH->bg);
+        tft.drawString(who, SCREEN_W / 2, 126, 4);
+      }
+
+      /* Confeti: se genera de forma continua y cae con gravedad */
+      static unsigned long confT = 0;
+      if (now - confT > 90) { 
+        confT = now;
+        static unsigned long confettiTimer = 0;
+          unsigned long currentMillis = millis();
+        if (currentMillis - confettiTimer > 50) {
+          confettiTimer = currentMillis;
+          int cx = random(0, SCREEN_W);
+          int cy = random(0, SCREEN_H - 50); 
+          uint16_t colors[] = {TFT_CYAN, TFT_MAGENTA, TFT_YELLOW, TFT_GREEN, TFT_ORANGE};
+          uint16_t cColor = colors[random(0, 5)];
+          tft.fillCircle(cx, cy, random(2, 6), cColor);
+          confettiTimer = currentMillis; 
+        } 
+      }
+
+      /* Sin sprite de campo en esta pantalla: se dibuja y borra cada partícula
+       * directamente, restaurando el fondo de su posición anterior.               */
+      for (int i = 0; i < MAX_PARTICLES; i++) {
+        if (!parts[i].active) continue;
+        int ox = (int)parts[i].x, oy = (int)parts[i].y;
+        int s  = parts[i].size;
+        parts[i].x += parts[i].vx * frameDt;
+        parts[i].y += parts[i].vy * frameDt;
+        parts[i].vy += 220.0f * frameDt;
+        parts[i].life -= frameDt;
+        tft.fillRect(ox - s, oy - s, s * 2 + 1, s * 2 + 1, TH->bg);   // Borra
+        if (parts[i].life <= 0 || parts[i].y > SCREEN_H) { parts[i].active = false; continue; }
+        // No se pinta sobre las zonas de texto (titulo 100..152 y marcador
+        // 152..168) para que el confeti no las ensucie.
+        if (parts[i].y < 96 || parts[i].y > 172) {
+          tft.fillCircle((int)parts[i].x, (int)parts[i].y, s, parts[i].color);
+        }
+      }
+
+      if (now - stateEnter > 600) {
+        if (btnEdge[0]) { clearParticles(); startMatch(vsAI); }   // Revancha
+        if (btnEdge[1]) { clearParticles(); menuIdx = 0; changeState(ST_MENU); }
+      }
+      break;
+    }
+  }
+
+  stateFirst = false;
+}
